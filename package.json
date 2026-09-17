@@ -1,0 +1,19 @@
+{
+  "name":"global-investment-limited",
+  "version":"2.0.0",
+  "private":true,
+  "description":"Global Investment Limited full-stack platform starter with auth, wallet, referrals, admin, Flutterwave adapter and security hardening.",
+  "main":"server.js",
+  "scripts":{"start":"node server.js","dev":"node server.js"},
+  "dependencies":{
+    "bcryptjs":"^2.4.3",
+    "better-sqlite3":"^11.7.0",
+    "dotenv":"^16.4.7",
+    "express":"^4.21.2",
+    "express-rate-limit":"^7.5.0",
+    "express-session":"^1.18.1",
+    "helmet":"^8.1.0",
+    "nodemailer":"^7.0.6",
+    "speakeasy":"^2.0.0"
+  }
+}

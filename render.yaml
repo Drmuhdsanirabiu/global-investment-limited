@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: global-investment-limited
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PAYMENT_PROVIDER
+        value: none
+      - key: SESSION_SECRET
+        generateValue: true
