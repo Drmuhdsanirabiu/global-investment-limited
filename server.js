@@ -19,7 +19,7 @@ db.pragma('foreign_keys = ON');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users(
- id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+ id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL, email TEXT UNIQUE, phone TEXT UNIQUE,
  password_hash TEXT NOT NULL, referral_code TEXT NOT NULL UNIQUE, balance REAL NOT NULL DEFAULT 0,
  role TEXT NOT NULL DEFAULT 'user',
  twofa_enabled INTEGER NOT NULL DEFAULT 0, twofa_secret TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -28,6 +28,18 @@ CREATE TABLE IF NOT EXISTS transactions(
  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, type TEXT NOT NULL, amount REAL NOT NULL,
  status TEXT NOT NULL DEFAULT 'pending', provider TEXT, reference TEXT UNIQUE, note TEXT,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS investments(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, plan_level INTEGER NOT NULL,
+ amount REAL NOT NULL, daily_rate REAL NOT NULL, daily_profit REAL NOT NULL, total_profit REAL NOT NULL,
+ start_at TEXT NOT NULL, maturity_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+ credited_days INTEGER NOT NULL DEFAULT 0, matured_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS investment_earnings(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, investment_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+ day_number INTEGER NOT NULL, amount REAL NOT NULL, credited_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(investment_id, day_number), FOREIGN KEY(investment_id) REFERENCES investments(id), FOREIGN KEY(user_id) REFERENCES users(id)
 );
 CREATE TABLE IF NOT EXISTS referrals(
  id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL UNIQUE,
@@ -43,6 +55,12 @@ CREATE TABLE IF NOT EXISTS webhook_events(
  payload TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `);
+
+try { const cols=db.prepare('PRAGMA table_info(users)').all(); if(!cols.some(c=>c.name==='phone')) db.exec('ALTER TABLE users ADD COLUMN phone TEXT'); db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique ON users(phone) WHERE phone IS NOT NULL AND phone<>''"); } catch(e) { console.error('users migration warning:',e.message); }
+
+const INVESTMENT_PLANS={1:{amount:3000,rate:0.10},2:{amount:6000,rate:0.10},3:{amount:10000,rate:0.10},4:{amount:20000,rate:0.15},5:{amount:40000,rate:0.15},6:{amount:80000,rate:0.15},7:{amount:120000,rate:0.15}};
+const REFERRAL_BONUS={1:1000,2:1000,3:2000,4:2000,5:3500,6:5000,7:5000};
+const INVESTMENT_DAYS=5,MIN_WITHDRAWAL=1500,MAX_WITHDRAWAL=50000,WITHDRAWAL_FEE_RATE=0.10;
 
 function seedAdmin(){
  const email='admin@globalinvestment.test';
@@ -66,10 +84,20 @@ app.use(express.static(path.join(__dirname,'public')));
 const authLimiter=rateLimit({windowMs:15*60*1000,max:10,skipSuccessfulRequests:true});
 const paymentLimiter=rateLimit({windowMs:15*60*1000,max:30});
 
-function cleanEmail(x){return String(x||'').trim().toLowerCase()}
+function cleanEmail(x){const v=String(x||'').trim().toLowerCase();return v||null}
+function cleanPhone(x){let v=String(x||'').trim().replace(/[\s()-]/g,'');if(v.startsWith('00'))v='+'+v.slice(2);if(/^0[789][0-9]{9}$/.test(v))v='+234'+v.slice(1);return v}
+function validPhone(v){return /^\+234[789][0-9]{9}$/.test(v)}
+function contactValue(body){const raw=String(body.contact||body.email||body.phone||'').trim();if(/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw))return {email:cleanEmail(raw),phone:null};const phone=cleanPhone(raw);if(validPhone(phone))return {email:null,phone};return null}
+function loginUser(login){const raw=String(login||'').trim();const phone=cleanPhone(raw);if(validPhone(phone))return db.prepare('SELECT * FROM users WHERE phone=?').get(phone);return db.prepare('SELECT * FROM users WHERE lower(email)=?').get(raw.toLowerCase())}
 function auth(req,res,next){if(!req.session.userId)return res.status(401).json({error:'Please log in.'});next()}
 function admin(req,res,next){if(!req.session.userId)return res.status(401).json({error:'Please log in.'});const u=db.prepare('SELECT role FROM users WHERE id=?').get(req.session.userId);if(!u||u.role!=='admin')return res.status(403).json({error:'Admin access required.'});next()}
-function userById(id){return db.prepare('SELECT id,full_name,email,referral_code,balance,role,twofa_enabled,created_at FROM users WHERE id=?').get(id)}
+function userById(id){return db.prepare("SELECT id,full_name,CASE WHEN email LIKE '%@phone.local' THEN NULL ELSE email END AS email,phone,referral_code,balance,role,twofa_enabled,created_at FROM users WHERE id=?").get(id)}
+function applyDueEarnings(){
+ const now=Date.now(),active=db.prepare("SELECT * FROM investments WHERE status='active'").all();
+ const run=db.transaction(inv=>{const elapsed=Math.min(INVESTMENT_DAYS,Math.floor((now-new Date(inv.start_at).getTime())/86400000));for(let day=inv.credited_days+1;day<=elapsed;day++){if(!db.prepare('SELECT id FROM investment_earnings WHERE investment_id=? AND day_number=?').get(inv.id,day)){db.prepare('INSERT INTO investment_earnings(investment_id,user_id,day_number,amount) VALUES(?,?,?,?)').run(inv.id,inv.user_id,day,inv.daily_profit);db.prepare('UPDATE users SET balance=balance+? WHERE id=?').run(inv.daily_profit,inv.user_id);}}if(elapsed>=INVESTMENT_DAYS){db.prepare('UPDATE users SET balance=balance+? WHERE id=?').run(inv.amount,inv.user_id);db.prepare("UPDATE investments SET credited_days=?,status='matured',matured_at=CURRENT_TIMESTAMP WHERE id=?").run(INVESTMENT_DAYS,inv.id);}else if(elapsed>inv.credited_days)db.prepare('UPDATE investments SET credited_days=? WHERE id=?').run(elapsed,inv.id);});for(const inv of active)run(inv);
+}
+setInterval(()=>{try{applyDueEarnings()}catch(e){console.error('earnings job:',e.message)}},60000);
+
 function audit(req,action,metadata={}){db.prepare('INSERT INTO audit_logs(user_id,action,ip,metadata) VALUES(?,?,?,?)').run(req.session.userId||null,action,req.ip,JSON.stringify(metadata))}
 function csrf(req,res,next){if(['GET','HEAD','OPTIONS'].includes(req.method))return next();const origin=req.get('origin');if(origin&&origin!==BASE_URL)return res.status(403).json({error:'Origin check failed.'});next()}
 app.use('/api',csrf);
@@ -81,20 +109,20 @@ app.get('/api/health',(req,res)=>res.json({ok:true,service:'global-investment-li
 app.get('/api/me',(req,res)=>{if(!req.session.userId)return res.json({authenticated:false});res.json({authenticated:true,user:userById(req.session.userId)})});
 
 app.post('/api/register',authLimiter,(req,res)=>{
- const {fullName,password,referralCode}=req.body;const email=cleanEmail(req.body.email);
- if(!fullName||!email||!password)return res.status(400).json({error:'Full name, email and password are required.'});
- if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))return res.status(400).json({error:'Enter a valid email.'});
+ const {fullName,password,referralCode}=req.body,c=contactValue(req.body);
+ if(!fullName||!c||!password)return res.status(400).json({error:'Full name, email or phone number, and password are required.'});
  if(String(password).length<8)return res.status(400).json({error:'Password must be at least 8 characters.'});
- if(db.prepare('SELECT id FROM users WHERE email=?').get(email))return res.status(409).json({error:'Email already registered.'});
+ if(c.email&&db.prepare('SELECT id FROM users WHERE email=?').get(c.email))return res.status(409).json({error:'Email already registered.'});
+ if(c.phone&&db.prepare('SELECT id FROM users WHERE phone=?').get(c.phone))return res.status(409).json({error:'Phone number already registered.'});
  let ref=null;if(referralCode)ref=db.prepare('SELECT id FROM users WHERE referral_code=?').get(String(referralCode).trim());
- const code='GI'+crypto.randomBytes(4).toString('hex').toUpperCase();
- const tx=db.transaction(()=>{const r=db.prepare('INSERT INTO users(full_name,email,password_hash,referral_code) VALUES(?,?,?,?)').run(String(fullName).trim(),email,bcrypt.hashSync(String(password),12),code);if(ref)db.prepare('INSERT INTO referrals(referrer_id,referred_id) VALUES(?,?)').run(ref.id,r.lastInsertRowid);return r.lastInsertRowid});
+ const code='GI'+crypto.randomBytes(4).toString('hex').toUpperCase(); const storedEmail=c.email||`phone.${c.phone.replace('+','')}@phone.local`;
+ const tx=db.transaction(()=>{const r=db.prepare('INSERT INTO users(full_name,email,phone,password_hash,referral_code) VALUES(?,?,?,?,?)').run(String(fullName).trim(),storedEmail,c.phone,bcrypt.hashSync(String(password),12),code);if(ref)db.prepare('INSERT INTO referrals(referrer_id,referred_id) VALUES(?,?)').run(ref.id,r.lastInsertRowid);return r.lastInsertRowid});
  const id=tx();req.session.userId=id;audit(req,'register');res.json({message:'Registration successful.',user:userById(id)});
 });
 
 app.post('/api/login',authLimiter,async(req,res)=>{
- const email=cleanEmail(req.body.email),password=String(req.body.password||''),u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
- if(!u||!bcrypt.compareSync(password,u.password_hash))return res.status(401).json({error:'Invalid email or password.'});
+ const login=String(req.body.contact||req.body.email||req.body.phone||'').trim(),password=String(req.body.password||''),u=loginUser(login);
+ if(!u||!bcrypt.compareSync(password,u.password_hash))return res.status(401).json({error:'Invalid email/phone number or password.'});
  if(u.twofa_enabled){const code=String(req.body.otp||'');if(!speakeasy.totp.verify({secret:u.twofa_secret,encoding:'base32',token:code,window:1}))return res.status(401).json({error:'2FA code required or invalid.'})}
  req.session.userId=u.id;audit(req,'login');res.json({message:'Login successful.',user:userById(u.id)});
 });
@@ -104,7 +132,16 @@ app.post('/api/2fa/setup',auth,(req,res)=>{const secret=speakeasy.generateSecret
 app.post('/api/2fa/enable',auth,(req,res)=>{const u=db.prepare('SELECT twofa_secret FROM users WHERE id=?').get(req.session.userId);if(!u?.twofa_secret)return res.status(400).json({error:'Run 2FA setup first.'});if(!speakeasy.totp.verify({secret:u.twofa_secret,encoding:'base32',token:String(req.body.otp||''),window:1}))return res.status(400).json({error:'Invalid code.'});db.prepare('UPDATE users SET twofa_enabled=1 WHERE id=?').run(req.session.userId);audit(req,'2fa_enabled');res.json({message:'2FA enabled.'})});
 app.post('/api/2fa/disable',auth,(req,res)=>{const u=db.prepare('SELECT twofa_secret FROM users WHERE id=?').get(req.session.userId);if(!u?.twofa_secret||!speakeasy.totp.verify({secret:u.twofa_secret,encoding:'base32',token:String(req.body.otp||''),window:1}))return res.status(400).json({error:'Invalid code.'});db.prepare('UPDATE users SET twofa_enabled=0,twofa_secret=NULL WHERE id=?').run(req.session.userId);res.json({message:'2FA disabled.'})});
 
-app.get('/api/dashboard',auth,(req,res)=>{const u=userById(req.session.userId);const tx=db.prepare('SELECT id,type,amount,status,provider,reference,note,created_at FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 50').all(u.id);const referrals=db.prepare('SELECT COUNT(*) count,COALESCE(SUM(commission),0) commission FROM referrals WHERE referrer_id=?').get(u.id);res.json({user:u,transactions:tx,referrals})});
+app.get('/api/dashboard',auth,(req,res)=>{const u=userById(req.session.userId);applyDueEarnings();const tx=db.prepare('SELECT id,type,amount,status,provider,reference,note,created_at FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 50').all(u.id);const investments=db.prepare('SELECT id,plan_level,amount,daily_rate,daily_profit,total_profit,start_at,maturity_at,status,credited_days,matured_at FROM investments WHERE user_id=? ORDER BY id DESC').all(u.id);const referrals=db.prepare('SELECT COUNT(*) count,COALESCE(SUM(commission),0) commission FROM referrals WHERE referrer_id=?').get(u.id);res.json({user:u,transactions:tx,investments,referrals})});
+app.get('/api/investment-plans',(req,res)=>res.json({plans:Object.entries(INVESTMENT_PLANS).map(([level,p])=>({level:Number(level),amount:p.amount,dailyRate:p.rate,dailyProfit:p.amount*p.rate,days:INVESTMENT_DAYS,referralBonus:REFERRAL_BONUS[level]})),withdrawal:{minimum:MIN_WITHDRAWAL,maximum:MAX_WITHDRAWAL,feeRate:WITHDRAWAL_FEE_RATE}}));
+app.get('/api/investments',auth,(req,res)=>{res.json(db.prepare('SELECT id,plan_level,amount,daily_rate,daily_profit,total_profit,start_at,maturity_at,status,credited_days,matured_at FROM investments WHERE user_id=? ORDER BY id DESC').all(req.session.userId))});
+app.post('/api/investment',auth,paymentLimiter,(req,res)=>{
+ const level=Number(req.body.level),plan=INVESTMENT_PLANS[level],u=userById(req.session.userId);if(!plan)return res.status(400).json({error:'Invalid investment level.'});
+ if(u.balance<plan.amount)return res.status(400).json({error:'Insufficient balance. Please deposit first.'});
+ const now=new Date(),maturity=new Date(now.getTime()+INVESTMENT_DAYS*86400000),dailyProfit=plan.amount*plan.rate,totalProfit=dailyProfit*INVESTMENT_DAYS;
+ try{db.transaction(()=>{db.prepare('UPDATE users SET balance=balance-? WHERE id=?').run(plan.amount,u.id);const r=db.prepare('INSERT INTO investments(user_id,plan_level,amount,daily_rate,daily_profit,total_profit,start_at,maturity_at) VALUES(?,?,?,?,?,?,?,?)').run(u.id,level,plan.amount,plan.rate,dailyProfit,totalProfit,now.toISOString(),maturity.toISOString());db.prepare('INSERT INTO transactions(user_id,type,amount,status,provider,reference,note) VALUES(?,?,?,?,?,?,?)').run(u.id,'investment',plan.amount,'approved','internal','INV-'+r.lastInsertRowid,'Level '+level+' investment activated.');const ref=db.prepare('SELECT referrer_id FROM referrals WHERE referred_id=?').get(u.id);if(ref){const bonus=REFERRAL_BONUS[level];db.prepare('UPDATE users SET balance=balance+? WHERE id=?').run(bonus,ref.referrer_id);db.prepare('UPDATE referrals SET commission=commission+? WHERE referred_id=?').run(bonus,u.id);db.prepare('INSERT INTO transactions(user_id,type,amount,status,provider,reference,note) VALUES(?,?,?,?,?,?,?)').run(ref.referrer_id,'referral_bonus',bonus,'approved','internal','REF-'+r.lastInsertRowid,'Referral bonus for Level '+level+' investment.');}})();audit(req,'investment_created',{level,amount:plan.amount});res.json({message:'Investment activated successfully.',level,amount:plan.amount,dailyProfit,totalProfit,maturityAt:maturity.toISOString()});}catch(e){res.status(400).json({error:e.message})}
+});
+
 app.get('/api/referrals',auth,(req,res)=>{const u=userById(req.session.userId);const rows=db.prepare('SELECT u.full_name,u.email,r.commission,r.created_at FROM referrals r JOIN users u ON u.id=r.referred_id WHERE r.referrer_id=? ORDER BY r.id DESC').all(u.id);res.json({code:u.referral_code,link:`${BASE_URL}/?ref=${u.referral_code}`,referrals:rows})});
 
 async function flutterwaveInitialize(req,email,name,amount,reference){const r=await fetch('https://api.flutterwave.com/v3/payments',{method:'POST',headers:{Authorization:`Bearer ${process.env.FLW_SECRET_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({tx_ref:reference,amount,currency:'NGN',redirect_url:`${BASE_URL}/?payment=flutterwave`,customer:{email,name}})});const d=await r.json();if(!r.ok||d.status!=='success')throw new Error(d.message||'Flutterwave initialization failed');return d.data.link}
@@ -122,16 +159,14 @@ app.post('/api/deposit',auth,paymentLimiter,async(req,res)=>{
 });
 
 app.post('/api/withdraw',auth,paymentLimiter,(req,res)=>{
- const amount=Number(req.body.amount);const u=userById(req.session.userId);if(!Number.isFinite(amount)||amount<=0)return res.status(400).json({error:'Enter a valid amount.'});if(amount>u.balance)return res.status(400).json({error:'Insufficient available balance.'});
- const ref='WD-'+Date.now()+'-'+crypto.randomBytes(3).toString('hex');db.prepare('INSERT INTO transactions(user_id,type,amount,status,provider,reference,note) VALUES(?,?,?,?,?,?,?)').run(u.id,'withdrawal',amount,'pending','manual',ref,'Withdrawal queued for admin approval.');audit(req,'withdrawal_created',{amount,reference:ref});res.json({message:'Withdrawal request submitted for review.',reference:ref});
+ applyDueEarnings();const amount=Number(req.body.amount),u=userById(req.session.userId);if(!Number.isFinite(amount)||amount<MIN_WITHDRAWAL)return res.status(400).json({error:`Minimum withdrawal is ₦${MIN_WITHDRAWAL.toLocaleString()}.`});if(amount>MAX_WITHDRAWAL)return res.status(400).json({error:`Maximum withdrawal is ₦${MAX_WITHDRAWAL.toLocaleString()}.`});if(amount>u.balance)return res.status(400).json({error:'Insufficient available balance.'});const fee=amount*WITHDRAWAL_FEE_RATE,net=amount-fee,ref='WD-'+Date.now()+'-'+crypto.randomBytes(3).toString('hex');db.prepare('INSERT INTO transactions(user_id,type,amount,status,provider,reference,note) VALUES(?,?,?,?,?,?,?)').run(u.id,'withdrawal',amount,'pending','manual',ref,`Withdrawal fee: ₦${fee.toFixed(2)}; net payout: ₦${net.toFixed(2)}.`);audit(req,'withdrawal_created',{amount,fee,net,reference:ref});res.json({message:'Withdrawal request submitted for review.',reference:ref,fee,net});
 });
-
 
 app.post('/api/webhooks/flutterwave',express.json({type:'application/json'}),(req,res)=>{if(!process.env.FLW_SECRET_HASH||req.get('verif-hash')!==process.env.FLW_SECRET_HASH)return res.status(401).end();const p=req.body;const eventId=`flutterwave:${p.data?.id||p.data?.tx_ref}`;try{db.prepare('INSERT INTO webhook_events(provider,event_id,payload) VALUES(?,?,?)').run('flutterwave',eventId,JSON.stringify(p))}catch(e){return res.status(200).end()};res.status(200).end();});
 
 app.get('/api/admin/summary',admin,(req,res)=>{const users=db.prepare("SELECT COUNT(*) count FROM users WHERE role='user'").get().count;const deposits=db.prepare("SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='deposit' AND status='approved'").get().total;const withdrawals=db.prepare("SELECT COALESCE(SUM(amount),0) total FROM transactions WHERE type='withdrawal' AND status='approved'").get().total;const pending=db.prepare("SELECT COUNT(*) count FROM transactions WHERE status='pending'").get().count;res.json({users,deposits,withdrawals,pending})});
-app.get('/api/admin/transactions',admin,(req,res)=>res.json(db.prepare('SELECT t.*,u.full_name,u.email FROM transactions t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC').all()));
-app.get('/api/admin/users',admin,(req,res)=>res.json(db.prepare('SELECT id,full_name,email,referral_code,balance,role,twofa_enabled,created_at FROM users ORDER BY id DESC').all()));
+app.get('/api/admin/transactions',admin,(req,res)=>res.json(db.prepare("SELECT t.*,u.full_name,CASE WHEN u.email LIKE '%@phone.local' THEN NULL ELSE u.email END AS email,u.phone FROM transactions t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC").all()));
+app.get('/api/admin/users',admin,(req,res)=>res.json(db.prepare("SELECT id,full_name,CASE WHEN email LIKE '%@phone.local' THEN NULL ELSE email END AS email,phone,referral_code,balance,role,twofa_enabled,created_at FROM users ORDER BY id DESC").all()));
 app.post('/api/admin/transactions/:id/:action',admin,(req,res)=>{const tx=db.prepare('SELECT * FROM transactions WHERE id=?').get(req.params.id);if(!tx||tx.status!=='pending')return res.status(400).json({error:'Transaction is not pending.'});if(req.params.action==='reject'){db.prepare("UPDATE transactions SET status='rejected',note=? WHERE id=?").run(req.body.note||'Rejected by admin.',tx.id);audit(req,'transaction_rejected',{id:tx.id});return res.json({message:'Transaction rejected.'})}if(req.params.action!=='approve')return res.status(400).json({error:'Invalid action.'});try{db.transaction(()=>{if(tx.type==='deposit')db.prepare('UPDATE users SET balance=balance+? WHERE id=?').run(tx.amount,tx.user_id);if(tx.type==='withdrawal'){const u=userById(tx.user_id);if(tx.amount>u.balance)throw new Error('Insufficient balance at approval time.');db.prepare('UPDATE users SET balance=balance-? WHERE id=?').run(tx.amount,tx.user_id)}db.prepare("UPDATE transactions SET status='approved',note=? WHERE id=?").run('Approved by admin.',tx.id)})();audit(req,'transaction_approved',{id:tx.id});res.json({message:'Transaction approved.'})}catch(e){res.status(400).json({error:e.message})}});
 
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
