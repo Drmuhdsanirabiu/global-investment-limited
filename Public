@@ -1,0 +1,6 @@
+public/
+├── index.html
+├── style.css
+├── app.js
+└── assets/
+    └── logo.png
