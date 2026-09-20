@@ -27,7 +27,7 @@
 5. Run `npm start`.
 6. Open Chrome at `http://localhost:3000`.
 
-### Demo admin
+###  admin
 Email: `admin@globalinvestment.test`
 Password: `Admin@12345`
 
@@ -54,6 +54,6 @@ The current build includes seven configurable investment levels:
 | 6 | NGN 80,000 | 15% | 5 | NGN 5,000 |
 | 7 | NGN 120,000 | 15% | 5 | NGN 5,000 |
 
-Withdrawals are configured with a NGN 1,500 minimum, NGN 50,000 maximum and a 10% fee. Investment principal is returned at maturity and daily earnings are credited once per elapsed day. The displayed rates are platform configuration and should not be presented as guaranteed returns; verify all applicable financial, consumer-protection and investment requirements before production use.
+Withdrawals are configured with a NGN 1,500 minimum, NGN 50,000 maximum and a 10% fee. Investment principal is returned at maturity and daily earnings are credited once per elapsed day. The displayed rates are platform configuration presented as guaranteed returns; verify all applicable financial, consumer-protection and investment requirements before production use.
 
 Authentication accepts either an email address or a Nigerian phone number (+234 format, with local 080... format also normalized). Existing email accounts remain supported.
